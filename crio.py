@@ -2,52 +2,44 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import openai
 import time
-from collections import deque
+from collections import deque, defaultdict
 from langchain_openai import ChatOpenAI
 from config import OPENAI_API_KEY  # Import API key from config.py
-
-import os
 
 # Initialize FastAPI
 app = FastAPI()
 
 
 class LLMClient:
-    """Handles communication with LLM backends, rate limiting, cost tracking, and logging"""
+    """Handles communication with LLM backends, agent-wise rate limiting, cost tracking, and logging"""
 
     cost_per_1000_tokens = {"openai": 0.002, "langchain": 0.002}  # Example cost
 
     def __init__(self, backend="openai", api_key=None, rate_limit=10):
         self.backend = backend
         self.api_key = api_key or OPENAI_API_KEY
-        self.rate_limit = rate_limit  # Max requests per minute (shared across agents)
-        self.requests_log = deque()  # Track request timestamps for rate limiting
-        self.prompts_log = {}  # Store prompts per agent
-        self.total_costs = {}  # Track cost per agent
+        self.rate_limit = rate_limit  # Max requests per minute per agent
+        self.requests_log = defaultdict(deque)  # Track request timestamps per agent
+        self.prompts_log = defaultdict(list)  # Store prompts per agent
+        self.total_costs = defaultdict(float)  # Track cost per agent
 
         if backend == "openai":
             self.client = openai.OpenAI(api_key=self.api_key)
         elif backend == "langchain":
             self.client = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=self.api_key)
 
-    def enforce_rate_limit(self):
-        """Ensures the LLM client does not exceed its global rate limit"""
+    def enforce_rate_limit(self, agent_id):
+        """Ensures each agent does not exceed their rate limit"""
         current_time = time.time()
-        while self.requests_log and self.requests_log[0] < current_time - 60:
-            self.requests_log.popleft()
-        if len(self.requests_log) >= self.rate_limit:
-            raise Exception("Global rate limit exceeded for LLMClient")
-        self.requests_log.append(current_time)
+        while self.requests_log[agent_id] and self.requests_log[agent_id][0] < current_time - 60:
+            self.requests_log[agent_id].popleft()
+        if len(self.requests_log[agent_id]) >= self.rate_limit:
+            raise Exception(f"Rate limit exceeded for agent {agent_id}")
+        self.requests_log[agent_id].append(current_time)
 
     def request(self, agent_id, prompt):
         """Handles request-response and tracks costs and logs per agent"""
-        self.enforce_rate_limit()  # Enforce global rate limit
-
-        if agent_id not in self.prompts_log:
-            self.prompts_log[agent_id] = []
-        if agent_id not in self.total_costs:
-            self.total_costs[agent_id] = 0.0
-
+        self.enforce_rate_limit(agent_id)  # Enforce agent-wise rate limit
         self.prompts_log[agent_id].append(prompt)
 
         if self.backend == "openai":
@@ -83,11 +75,11 @@ class LLMClient:
 
     def get_cost(self, agent_id):
         """Returns total cost for a specific agent"""
-        return self.total_costs.get(agent_id, 0.0)
+        return self.total_costs[agent_id]
 
     def get_all_prompts(self, agent_id):
         """Returns all prompts submitted by a specific agent"""
-        return self.prompts_log.get(agent_id, [])
+        return self.prompts_log[agent_id]
 
 
 class Agent:
